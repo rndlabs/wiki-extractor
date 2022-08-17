@@ -44,10 +44,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "904dfeac50f3cdaba28fc6f57fdcddb75f49ed61346676a78c4ffe55877802fd"
 
 [[package]]
+name = "bee-api"
+version = "0.1.0"
+source = "git+http://github.com/rndlabs/bee-api-rs#c3911c923b553c66c1249eac4bec647d55bdd7b5"
+dependencies = [
+ "hex",
+ "reqwest",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "bee_herder"
 version = "0.1.0"
 dependencies = [
+ "bee-api",
  "bincode",
+ "clap",
  "hex",
  "indicatif 0.17.0",
  "reqwest",

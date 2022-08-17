@@ -5,9 +5,11 @@ use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf}, borrow::BorrowMut,
     sync::mpsc,
+    env,
 };
 
 use bee_herder::{HerdFile, HerdStatus};
+use clap::ArgMatches;
 use indicatif::{ProgressBar, ProgressStyle};
 use kuchiki::{parse_html, traits::TendrilSink};
 use rayon::prelude::*;
@@ -54,25 +56,30 @@ impl Error for SkipMissingTargetError {}
 pub struct Config {
     pub input: String,
     pub output: String,
+    pub db: String,
 }
 
 impl Config {
-    pub fn new(mut args: impl Iterator<Item = String>) -> Result<Config, &'static str> {
-        args.next();
+    pub fn new(matches: ArgMatches) -> Result<Config, &'static str> {
 
-        let input = match args.next() {
-            Some(arg) => arg,
-            None => return Err("Didn't get a input file name"),
+        let input = matches.value_of("input").unwrap().to_string();
+        let output = matches.value_of("output").unwrap().to_string();
+        // return err if db is not set
+        let db = match env::var("BEE_HERDER_DB") {
+            Ok(val) => val,
+            Err(_) => return Err("Environment variable BEE_HERDER_DB must be set"),
         };
-
-        let output = match args.next() {
-            Some(arg) => arg,
-            None => return Err("Didn't get a output directory name"),
+    
+        let config = Config {
+            input,
+            output,
+            db,
         };
-
-        Ok(Config { input, output })
+    
+        Ok(config)
     }
 }
+
 
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // eprintln!("Number of article: {}", zim.article_count());

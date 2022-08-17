@@ -1,11 +1,11 @@
 use clap::{App, Arg};
-use std::{error::Error, process};
+use std::{env, error::Error, process};
 use wiki_extractor::{run, Config};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let matches = App::new("wiki_extractor")
         .version("0.1.0")
-        .about("Extracts and enhances the Wikipedia ZIM file")
+        .about("Marshalling the world's knowledge 🌐📚🐝")
         .author("mfw78")
         .arg(
             Arg::with_name("input")
@@ -26,15 +26,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .required(true),
         )
         .get_matches();
+    // TODO: Write detailed usage instructions
 
-    let input = matches.value_of("input").unwrap();
-    let output = matches.value_of("output").unwrap();
-
-    let config = Config {
-        input: input.to_string(),
-        output: output.to_string(),
-    };
-
+    let config = Config::new(matches).unwrap_or_else(|err| {
+        eprintln!("Problem parsing configuration variables: {}", err);
+        process::exit(1)
+    });
+    
     // run the program
     if let Err(e) = run(config) {
         eprintln!("Application error: {}", e);
