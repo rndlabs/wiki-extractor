@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("Problem parsing configuration variables: {}", err);
         process::exit(1)
     });
-    
+
     // run the program
     if let Err(e) = run(config) {
         eprintln!("Application error: {}", e);

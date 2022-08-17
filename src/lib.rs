@@ -1,11 +1,12 @@
 use std::{
+    borrow::BorrowMut,
     collections::HashMap,
+    env,
     error::Error,
     fs::File,
     io::{BufWriter, Write},
-    path::{Path, PathBuf}, borrow::BorrowMut,
+    path::{Path, PathBuf},
     sync::mpsc,
-    env,
 };
 
 use bee_herder::{HerdFile, HerdStatus};
@@ -22,7 +23,7 @@ use flate2::Compression;
 pub struct ClusterNotFoundError {
     pub cluster: usize,
 }
-impl  std::fmt::Display for ClusterNotFoundError {
+impl std::fmt::Display for ClusterNotFoundError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Cluster {} not found", self.cluster)
     }
@@ -34,7 +35,7 @@ impl Error for ClusterNotFoundError {}
 pub struct InvalidBlobError {
     pub blob: String,
 }
-impl  std::fmt::Display for InvalidBlobError {
+impl std::fmt::Display for InvalidBlobError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Invalid blob: {}", self.blob)
     }
@@ -46,7 +47,7 @@ impl Error for InvalidBlobError {}
 pub struct SkipMissingTargetError {
     pub target: String,
 }
-impl  std::fmt::Display for SkipMissingTargetError {
+impl std::fmt::Display for SkipMissingTargetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Skip missing target: {}", self.target)
     }
@@ -61,7 +62,6 @@ pub struct Config {
 
 impl Config {
     pub fn new(matches: ArgMatches) -> Result<Config, &'static str> {
-
         let input = matches.value_of("input").unwrap().to_string();
         let output = matches.value_of("output").unwrap().to_string();
         // return err if db is not set
@@ -69,17 +69,12 @@ impl Config {
             Ok(val) => val,
             Err(_) => return Err("Environment variable BEE_HERDER_DB must be set"),
         };
-    
-        let config = Config {
-            input,
-            output,
-            db,
-        };
-    
+
+        let config = Config { input, output, db };
+
         Ok(config)
     }
 }
-
 
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // eprintln!("Number of article: {}", zim.article_count());
@@ -144,7 +139,14 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
 
             // make sure the path is valid
             if let Ok(path) = path {
-                let path = path.strip_prefix(root_output).unwrap().to_str().unwrap().to_string().as_bytes().to_vec();
+                let path = path
+                    .strip_prefix(root_output)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+                    .as_bytes()
+                    .to_vec();
 
                 // process the metadata
                 let mut metadata: HashMap<String, String> = HashMap::new();
@@ -163,7 +165,8 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                     reference: None,
                     mantaray_reference: None,
                     metadata,
-                }).expect("Failed to send entry");
+                })
+                .expect("Failed to send entry");
             } else {
                 pb.inc(1);
             }
@@ -222,7 +225,8 @@ fn enhance_html(dst: &Path, blob: &[u8]) -> Result<(), Box<dyn Error>> {
 
     // process all `source`, `img`, and `track` src attributes
     root.as_node()
-        .select("img,track,source").unwrap()
+        .select("img,track,source")
+        .unwrap()
         .borrow_mut()
         .for_each(|mut e| {
             let rc = &e.borrow_mut().attributes;
@@ -236,7 +240,8 @@ fn enhance_html(dst: &Path, blob: &[u8]) -> Result<(), Box<dyn Error>> {
 
     // process all `script` src attributes
     root.as_node()
-        .select("script").unwrap()
+        .select("script")
+        .unwrap()
         .borrow_mut()
         .for_each(|mut e| {
             let rc = &e.borrow_mut().attributes;
@@ -248,11 +253,10 @@ fn enhance_html(dst: &Path, blob: &[u8]) -> Result<(), Box<dyn Error>> {
             attributes.insert("src", src);
         });
 
-
     root.as_node()
         // .serialize_to_file(dst)?;
         .serialize(&mut enc)?;
-            
+
     let output: Vec<u8> = enc.finish()?;
 
     safe_write(dst, output, 1);
@@ -269,7 +273,9 @@ fn process_file<'a>(
     let dst = make_path(root_output, entry.namespace, &entry.url, &entry.mime_type);
     match entry.target.as_ref() {
         Some(Target::Cluster(cluster_index, blob_idx)) => {
-            let cluster = cluster_map.get(cluster_index).ok_or(ClusterNotFoundError{ cluster: *cluster_index as usize })?;
+            let cluster = cluster_map.get(cluster_index).ok_or(ClusterNotFoundError {
+                cluster: *cluster_index as usize,
+            })?;
 
             match cluster.get_blob(*blob_idx) {
                 Ok(blob) => {
@@ -290,7 +296,10 @@ fn process_file<'a>(
             Ok(dst)
         }
         Some(_) => unreachable!("filtered out earlier"),
-        None => Err(SkipMissingTargetError{ target: entry.url.clone() }.into()),
+        None => Err(SkipMissingTargetError {
+            target: entry.url.clone(),
+        }
+        .into()),
     }
 }
 
