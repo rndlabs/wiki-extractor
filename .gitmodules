@@ -1,0 +1,3 @@
+[submodule "bee_herder"]
+	path = bee_herder
+	url = git@github.com:rndlabs/bee-herder.git
