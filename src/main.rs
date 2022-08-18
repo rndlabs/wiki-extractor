@@ -1,5 +1,5 @@
 use clap::{App, Arg};
-use std::{env, error::Error, process};
+use std::{error::Error, process};
 use wiki_extractor::{run, Config};
 
 fn main() -> Result<(), Box<dyn Error>> {
