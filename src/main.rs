@@ -1,8 +1,10 @@
 use clap::{App, Arg};
-use std::{error::Error, process};
+use std::process;
 use wiki_extractor::{run, Config};
 
-fn main() -> Result<(), Box<dyn Error>> {
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send>>;
+
+fn main() -> Result<()> {
     let matches = App::new("wiki_extractor")
         .version("0.1.0")
         .about("Marshalling the world's knowledge 🌐📚🐝")

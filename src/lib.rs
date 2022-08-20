@@ -2,7 +2,6 @@ use std::{
     borrow::BorrowMut,
     collections::HashMap,
     env,
-    error::Error,
     fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -14,45 +13,32 @@ use clap::ArgMatches;
 use indicatif::{ProgressBar, ProgressStyle};
 use kuchiki::{parse_html, traits::TendrilSink};
 use rayon::prelude::*;
-use zim::{Cluster, DirectoryEntry, MimeType, Namespace, Target, Zim};
+use zim::{MimeType, Namespace, Target, Zim};
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
-#[derive(Debug, Clone)]
-pub struct ClusterNotFoundError {
-    pub cluster: usize,
-}
-impl std::fmt::Display for ClusterNotFoundError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Cluster {} not found", self.cluster)
-    }
-}
-impl Error for ClusterNotFoundError {}
+use thiserror::Error;
 
-// invalid blob error
-#[derive(Debug, Clone)]
-pub struct InvalidBlobError {
-    pub blob: String,
-}
-impl std::fmt::Display for InvalidBlobError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Invalid blob: {}", self.blob)
-    }
-}
-impl Error for InvalidBlobError {}
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send>>;
 
-// skip missing target
-#[derive(Debug, Clone)]
-pub struct SkipMissingTargetError {
-    pub target: String,
+#[derive(Error, Debug, Clone)]
+pub enum WikiExtractorError {
+    #[error("Missing environment variable: {0}")]
+    MissingEnvVarError(String),
+    #[error("Cluster {0} not found")]
+    ClusterNotFound(usize),
+    #[error("Invalid blob: {0}")]
+    InvalidBlob(String),
+    #[error("Skip missing target: {0}")]
+    SkipMissingTargetError(String),
+    #[error("zim error: {0}")]
+    Zim(String),
+    #[error("compress error: {0}")]
+    Compress(String),
+    #[error("io error: {0}")]
+    Io(String),
 }
-impl std::fmt::Display for SkipMissingTargetError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Skip missing target: {}", self.target)
-    }
-}
-impl Error for SkipMissingTargetError {}
 
 pub struct Config {
     pub input: String,
@@ -61,13 +47,13 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(matches: ArgMatches) -> Result<Config, &'static str> {
+    pub fn new(matches: ArgMatches) -> Result<Config> {
         let input = matches.value_of("input").unwrap().to_string();
         let output = matches.value_of("output").unwrap().to_string();
         // return err if db is not set
         let db = match env::var("BEE_HERDER_DB") {
             Ok(val) => val,
-            Err(_) => return Err("Environment variable BEE_HERDER_DB must be set"),
+            Err(_) => return Err(Box::new(WikiExtractorError::MissingEnvVarError("BEE_HERDER_DB".to_string()))),
         };
 
         let config = Config { input, output, db };
@@ -76,17 +62,25 @@ impl Config {
     }
 }
 
-pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
+pub fn run(config: Config) -> Result<()> {
     // eprintln!("Number of article: {}", zim.article_count());
 
     eprintln!("Extracting file {} to {}", config.input, config.output);
 
-    let sw = std::time::Instant::now();
-    let zim = Zim::new(config.input)?;
+    let zim = Zim::new(config.input);
+    // if an error, get the error and bubble it up
+    if zim.is_err() {
+        return Err(Box::new(WikiExtractorError::Zim(zim.err().unwrap().to_string())));
+    }
+    let zim = zim.unwrap();
 
-    let pb = ProgressBar::new(zim.article_count() as u64);
+    // generate an index of clusters to directory entries
+    let (num_articles, clusters) = cluster_to_entries_index(&zim);
+
+    let sw = std::time::Instant::now();
+    let pb = ProgressBar::new(num_articles);
     pb.set_style(ProgressStyle::default_bar()
-        .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
+        .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})").unwrap()
         .progress_chars("#>-"));
 
     let root_output = Path::new(&config.output);
@@ -94,82 +88,135 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
 
     ensure_dir(root_output);
 
-    // map between cluster and directory entry
-    let mut cluster_map = HashMap::new();
-
-    for i in 0..zim.header.cluster_count {
-        let cluster = zim.get_cluster(i).expect("Failed to get cluster");
-        cluster_map.insert(i, cluster);
-    }
-
     // create a sync channel to send the directory entry to the thread
-    let (tx, rx) = mpsc::sync_channel::<HerdFile>(100);
+    let (tx, rx) = mpsc::sync_channel::<Option<HerdFile>>(100);
 
-    // create a thread to handle the directory entries and log them to a leveldb database
+    pb.set_message("Writing entries to disk");
+
+    // create a thread to handle the directory entries and log them to a database
     let handle = std::thread::spawn(move || {
         let db = sled::open(db_output_path).expect("Failed to open database");
         let mut batch = sled::Batch::default();
 
+        // read current number of pending entries
+        let mut num_pending: u64 = match db.get(bincode::serialize(&HerdStatus::Pending).unwrap()).unwrap() {
+            Some(b) => bincode::deserialize(&b).unwrap(),
+            None => 0,
+        };
+
+        let mut num_failed = 0;
         let mut count = 0;
         for entry in rx {
-            // let the key be f_ concatenated with entry.path
-            let mut key = "f_".as_bytes().to_vec();
-            key.extend_from_slice(&entry.path);
-            let value = bincode::serialize(&entry).expect("Failed to serialize entry");
-            batch.insert(key, value);
+            match entry {
+                Some(entry) => {               
+                    // let the key be f_ concatenated with entry.path
+                    let mut key = "f_".as_bytes().to_vec();
+                    key.extend_from_slice(&entry.path);
+                    let value = bincode::serialize(&entry).expect("Failed to serialize entry");
+                    batch.insert(key, value);
 
-            count += 1;
-            if count % 1000 == 0 {
-                db.apply_batch(batch).expect("Failed to apply batch");
-                batch = sled::Batch::default();
+                    count += 1;
+                    if count % 1000 == 0 {
+                        batch.insert(bincode::serialize(&HerdStatus::Pending).unwrap(), bincode::serialize(&(num_pending + count)).unwrap());
+                        db.apply_batch(batch).expect("Failed to apply batch");
+                        batch = sled::Batch::default();
+                    }
+                },
+                None => {
+                    num_failed += 1;
+                },
             }
+
+            pb.inc(1);
         }
 
+        num_pending += count;
+        batch.insert(bincode::serialize(&HerdStatus::Pending).unwrap(), bincode::serialize(&num_pending).unwrap());
         db.apply_batch(batch).expect("Failed to apply batch");
-    });
+
+        pb.finish_with_message(format!("Extraction done in {}s with {} failures", sw.elapsed().as_secs(), num_failed));
+    }); 
 
     // parallel processing of the entries
-    let entries: Vec<_> = zim.iterate_by_urls().collect();
-    pb.set_message("Writing entries to disk");
-    entries
+
+    // unlike the extractor in `zim` crate, we want to extract by cluster
+    // we do this because the cluster struct caches the decompressed 
+    clusters
         .par_iter()
-        .filter(|entry| matches!(entry.target.as_ref(), Some(Target::Cluster(_, _))))
-        .for_each(|entry| {
-            let path = process_file(root_output, &cluster_map, entry, &pb);
+        .filter(|(_, entries)| entries.len() > 0)
+        .filter(|(cluster_index, _)| zim.get_cluster(**cluster_index).is_ok())
+        .for_each(|cluster| {
+            let (cluster, article_blob_map) = cluster;
 
-            // make sure the path is valid
-            if let Ok(path) = path {
-                let path = path
-                    .strip_prefix(root_output)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string()
-                    .as_bytes()
-                    .to_vec();
+            // get the cluster
+            let cluster_object = zim.get_cluster(*cluster).unwrap();
 
-                // process the metadata
-                let mut metadata: HashMap<String, String> = HashMap::new();
+            // iterate through the entries
+            article_blob_map.iter()
+                .map(|(article_id, blob_id)| (zim.get_by_url_index(*article_id).unwrap(), blob_id))
+                .filter(|(entry, _)| matches!(entry.mime_type, MimeType::Type(_)))
+                .for_each(|(entry, blob_id)| {
+                    let path = make_path(root_output, entry.namespace, &entry.url, &entry.mime_type);
+                    let written = match cluster_object.get_blob(*blob_id) {
+                        Ok(blob) => {
+                            if let MimeType::Type(mime) = &entry.mime_type {
+                                if mime == "text/html" {
+                                    enhance_html(&path, &blob)
+                                } else {
+                                    safe_write(&path, blob, 1)
+                                }
+                            } else {
+                                safe_write(&path, blob, 1)
+                            }
+                        }
+                        Err(e) => Err(Box::new(WikiExtractorError::Io(e.to_string())) as Box<dyn std::error::Error + Send>),
+                    };
 
-                if let MimeType::Type(t) = &entry.mime_type {
-                    metadata.insert("Content-Type".to_string(), t.to_string());
-                    metadata.insert("Filename".to_string(), entry.url.to_string());
-                }
-
-                // send the entry to the thread
-                tx.send(HerdFile {
-                    path,
-                    prefix: entry.url.as_bytes().to_vec(),
-                    status: HerdStatus::Pending,
-                    tag: None,
-                    reference: None,
-                    mantaray_reference: None,
-                    metadata,
-                })
-                .expect("Failed to send entry");
-            } else {
-                pb.inc(1);
-            }
+                    match written {
+                        Ok(_) => {
+                            let path = path
+                                .strip_prefix(root_output)
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                                .to_string()
+                                .as_bytes()
+                                .to_vec();
+            
+                            // process the metadata
+                            let mut metadata: HashMap<String, String> = HashMap::new();
+        
+                            // if it's text/html, override this as we've gzipped it
+            
+                            if let MimeType::Type(mime) = &entry.mime_type {
+                                if mime == "text/html" {
+                                    metadata.insert("Content-Type".to_string(), "application/octet-stream".to_string());
+                                } else {
+                                    metadata.insert("Content-Type".to_string(), mime.to_string());
+                                }
+                            }
+        
+                            metadata.insert("Filename".to_string(), entry.url.to_string());
+            
+                            // send the entry to the thread
+                            tx.send(Some(HerdFile {
+                                path,
+                                prefix: entry.url.as_bytes().to_vec(),
+                                status: HerdStatus::Pending,
+                                tag: None,
+                                reference: None,
+                                mantaray_reference: None,
+                                metadata,
+                            }))
+                            .expect("Failed to send entry");
+                        },
+                        Err(e) => {
+                            // print failure message of cluster, blob and article as well as path
+                            eprintln!("Failed to write {} from cluster {} blob {} article {} error {}", path.display(), cluster, blob_id, entry.url, e);
+                            tx.send(None).unwrap();
+                        },
+                    }
+                });
         });
 
     // close the channel
@@ -178,13 +225,11 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // wait for the thread to finish
     handle.join().unwrap();
 
-    pb.finish_with_message(format!("Extraction done in {}s", sw.elapsed().as_secs()));
-
     Ok(())
 }
 
-fn safe_write<T: AsRef<[u8]>>(path: &Path, data: T, count: usize) {
-    let display = path.display();
+fn safe_write<T: AsRef<[u8]>>(path: &Path, data: T, count: usize) -> Result<()> {
+    // let display = path.display();
     let contain_path = path.parent().unwrap();
 
     ensure_dir(contain_path);
@@ -192,25 +237,26 @@ fn safe_write<T: AsRef<[u8]>>(path: &Path, data: T, count: usize) {
     match File::create(&path) {
         Err(why) => {
             if count < 3 {
-                safe_write(path, data, count + 1);
+                safe_write(path, data, count + 1)
             } else {
-                eprintln!(
-                    "skipping: failed retry: couldn't create {}: {:?}",
-                    display, why
-                );
+                Err(Box::new(why))
             }
         }
         Ok(file) => {
             let mut writer = BufWriter::new(&file);
 
-            if let Err(why) = writer.write_all(data.as_ref()) {
-                eprintln!("skipping: couldn't write to {}: {}", display, why);
+            let success = writer.write_all(data.as_ref());
+
+            if success.is_err() {
+                Err(Box::new(success.err().unwrap()))
+            } else {
+                Ok(())
             }
         }
     }
 }
 
-fn enhance_html(dst: &Path, blob: &[u8]) -> Result<(), Box<dyn Error>> {
+fn enhance_html(dst: &Path, blob: &[u8]) -> Result<()> {
     // before we do any processing, declare the zlib compressor for streaming
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
 
@@ -219,7 +265,7 @@ fn enhance_html(dst: &Path, blob: &[u8]) -> Result<(), Box<dyn Error>> {
 
     // strip out some html
     let root = parse_html()
-        .one(String::from_utf8(<&[u8]>::clone(&blob).to_vec())?)
+        .one(String::from_utf8(<&[u8]>::clone(&blob).to_vec()).unwrap())
         .select_first("body")
         .unwrap();
 
@@ -253,54 +299,25 @@ fn enhance_html(dst: &Path, blob: &[u8]) -> Result<(), Box<dyn Error>> {
             attributes.insert("src", src);
         });
 
-    root.as_node()
-        // .serialize_to_file(dst)?;
-        .serialize(&mut enc)?;
+    let res = root.as_node()
+        .serialize(&mut enc);
 
-    let output: Vec<u8> = enc.finish()?;
-
-    safe_write(dst, output, 1);
-
-    Ok(())
-}
-
-fn process_file<'a>(
-    root_output: &Path,
-    cluster_map: &'a HashMap<u32, Cluster<'a>>,
-    entry: &DirectoryEntry,
-    pb: &ProgressBar,
-) -> Result<PathBuf, Box<dyn Error>> {
-    let dst = make_path(root_output, entry.namespace, &entry.url, &entry.mime_type);
-    match entry.target.as_ref() {
-        Some(Target::Cluster(cluster_index, blob_idx)) => {
-            let cluster = cluster_map.get(cluster_index).ok_or(ClusterNotFoundError {
-                cluster: *cluster_index as usize,
-            })?;
-
-            match cluster.get_blob(*blob_idx) {
-                Ok(blob) => {
-                    if let MimeType::Type(mime) = &entry.mime_type {
-                        if mime == "text/html" {
-                            enhance_html(&dst, &blob)?;
-                        } else {
-                            safe_write(&dst, blob, 1);
-                        }
-                    } else {
-                        safe_write(&dst, blob, 1);
-                    }
-                }
-                Err(err) => return Err(Box::new(err)),
-            }
-            pb.inc(1);
-
-            Ok(dst)
-        }
-        Some(_) => unreachable!("filtered out earlier"),
-        None => Err(SkipMissingTargetError {
-            target: entry.url.clone(),
-        }
-        .into()),
+    // if res is an error, return the error in a Box
+    if let Err(e) = res {
+        return Err(Box::new(WikiExtractorError::Compress(e.to_string())));
     }
+
+    let output = enc.finish();
+
+    // if output is an error, return the error in a Box
+    if let Err(e) = output {
+        return Err(Box::new(WikiExtractorError::Compress(e.to_string())));
+    }
+
+    // unwrap the output
+    let output = output.unwrap();
+
+    safe_write(dst, output, 1)
 }
 
 fn ensure_dir(path: &Path) {
@@ -377,4 +394,52 @@ fn make_path(root: &Path, namespace: Namespace, url: &str, mime_type: &MimeType)
     }
 
     path
+}
+
+fn cluster_to_entries_index(zim: &Zim) -> (u64, HashMap<u32, HashMap<u32, u32>>) {
+    let mut cluster_index = HashMap::new();
+    let num_articles = zim.article_count() as u64;
+    let mut num_redirects = 0;
+
+    let sw = std::time::Instant::now();
+
+    let pb = ProgressBar::new(zim.article_count() as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})").unwrap()
+        .progress_chars("#>-"));
+
+    pb.set_message("Generating cluster index");
+
+    // monitor performance of the for loop
+    let start = std::time::Instant::now();
+    for (article_id, entry) in zim.iterate_by_urls().enumerate() {
+        match entry.target {
+            Some(target) => match target {
+                Target::Cluster(cluster, blob) => {
+                    cluster_index
+                        .entry(cluster)
+                        .and_modify(|v: &mut HashMap<u32, u32>| { v.insert(article_id.try_into().unwrap(), blob); })
+                        .or_insert((|| {
+                            let mut map = HashMap::new();
+                            map.insert(article_id as u32, blob);
+                            map
+                        })());
+                }
+                Target::Redirect(_) => num_redirects += 1,
+            },
+            None => {}
+        }
+
+        pb.inc(1);
+    }
+
+    pb.finish_with_message(format!("Extraction done in {}s, finding {} redirects", sw.elapsed().as_secs(), num_redirects));
+    println!(
+        "Processed {} articles in {}ms",
+        num_articles,
+        start.elapsed().as_millis()
+    );
+    println!("Found {} redirects", num_redirects);
+
+    (num_articles - num_redirects, cluster_index)
 }
