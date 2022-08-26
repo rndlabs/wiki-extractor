@@ -1,6 +1,6 @@
 use std::{
     borrow::BorrowMut,
-    collections::HashMap,
+    collections::{HashMap, BTreeMap},
     env,
     fs::File,
     io::{BufWriter, Write},
@@ -205,7 +205,7 @@ pub fn run(config: Config) -> Result<()> {
                     match written {
                         Ok(_) => {
                             // process the metadata
-                            let mut metadata: HashMap<String, String> = HashMap::new();
+                            let mut metadata: BTreeMap<String, String> = BTreeMap::new();
 
                             // if it's text/html, override this as we've gzipped it
 
