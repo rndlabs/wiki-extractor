@@ -181,6 +181,7 @@ pub fn run(config: Config) -> Result<()> {
                     )
                 })
                 .filter(|(_, entry, _)| matches!(entry.mime_type, MimeType::Type(_)))
+                .filter(|(_, entry, _)| entry.mime_type != MimeType::Type("application/octet-stream+xapian".to_string()))
                 .for_each(|(article_id, entry, blob_id)| {
                     // compute the path as a combination of the root output and the article_id
                     let mut path = root_output.to_path_buf();
