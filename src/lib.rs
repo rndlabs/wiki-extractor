@@ -91,7 +91,7 @@ pub fn run(config: Config) -> Result<()> {
         .progress_chars("#>-"));
 
     let root_output = Path::new(&config.output);
-    let db_output_path = Path::new(&config.output).join("db");
+    let db_output_path = Path::new(&config.db);
 
     ensure_dir(root_output);
 
@@ -101,8 +101,9 @@ pub fn run(config: Config) -> Result<()> {
     pb.set_message("Writing entries to disk");
 
     // create a thread to handle the directory entries and log them to a database
+    let db_output_clone = config.db.clone();
     let handle = std::thread::spawn(move || {
-        let db = sled::open(db_output_path).expect("Failed to open database");
+        let db = sled::open(db_output_clone).expect("Failed to open database");
         let mut batch = sled::Batch::default();
 
         // read current number of pending entries
