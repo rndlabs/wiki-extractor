@@ -1,3 +1,4 @@
+#![feature(let_chains)]
 use std::{
     borrow::BorrowMut,
     collections::{HashMap, BTreeMap},
